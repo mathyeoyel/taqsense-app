@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import os
+import re
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import plotly.express as px
 import pydeck as pdk
@@ -58,16 +59,32 @@ model = fp.model
 scaler = fp.scaler
 
 # ─── Interactive Map for Region Selection ───
-# Load full coords CSV and prepare lat/lon
 coords_csv = find_default_csv(DEFAULT_CSV)
 coords_df = pd.read_csv(coords_csv, comment='#')
-coords_df['date'] = pd.to_datetime(coords_df['date'], dayfirst=True, errors='coerce')
-coords_df.rename(columns={'ADM2_NAME':'region','Latitude':'lat','Longitude':'lon'}, inplace=True)
+
+def parse_coord(s):
+    """Extract float from strings like '4.6000° N' or '33.1234° W'."""
+    if pd.isna(s):
+        return np.nan
+    s = s.strip()
+    m = re.match(r'([0-9\.]+)°\s*([NSEW])', s)
+    if not m:
+        return np.nan
+    val, hemi = m.groups()
+    val = float(val)
+    if hemi in ('S', 'W'):
+        val = -val
+    return val
+
+coords_df.rename(
+    columns={'ADM2_NAME': 'region', 'Latitude': 'lat_str', 'Longitude': 'lon_str'},
+    inplace=True
+)
+coords_df['lat'] = coords_df['lat_str'].apply(parse_coord)
+coords_df['lon'] = coords_df['lon_str'].apply(parse_coord)
 coords_df = coords_df.dropna(subset=['lat','lon']).drop_duplicates(subset=['region'])
 
 st.sidebar.markdown("### Or select region via map👇")
-
-# Initialize session state for map selection
 if 'map_selected' not in st.session_state:
     st.session_state.map_selected = None
 
@@ -79,22 +96,18 @@ layer = pdk.Layer(
     get_radius=20000,
     get_fill_color=[0, 128, 255, 160],
 )
-
 view_state = pdk.ViewState(
     latitude=float(coords_df['lat'].mean()),
     longitude=float(coords_df['lon'].mean()),
     zoom=5,
     pitch=0,
 )
-
 r = st.sidebar.pydeck_chart(pdk.Deck(
     map_style='mapbox://styles/mapbox/light-v9',
     initial_view_state=view_state,
     layers=[layer],
     tooltip={"text": "{region}"}
 ))
-
-# Capture clicks
 if r.selected_rows:
     st.session_state.map_selected = r.selected_rows[0]['region']
 
@@ -104,13 +117,12 @@ if "health" in params:
     st.write("healthy")
     st.stop()
 
-# Optional page configuration
+# Page configuration
 st.set_page_config(
     page_title="Taqsense Dashboard",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 st.title("Taqsense Rainfall Forecasting & Backtest Dashboard")
 
 # Date-range picker
@@ -128,7 +140,7 @@ if start_date > end_date:
 # Mode selector
 tool = st.sidebar.selectbox("Mode", ["Forecast", "Backtest", "Tune Window Size"])
 
-# Region selector (uses map click as default if available)
+# Region selector (uses map click as default)
 regions = sorted(data['region'].unique())
 if tool == "Forecast":
     default = [st.session_state.map_selected] if st.session_state.map_selected else [regions[0]]
@@ -144,7 +156,7 @@ else:
         "Select region:", regions, index=default_idx
     )
 
-# Hyperparameter sliders
+# Hyperparameter slider
 window_size = st.sidebar.slider("Window size (dekads)", 10, 60, 30, 10)
 
 # --------- Forecast Branch ---------
@@ -207,7 +219,6 @@ elif tool == "Backtest":
     if seqs.size == 0:
         st.warning("Not enough data for backtest.")
     else:
-        # batch predict
         all_preds = model.predict(seqs, batch_size=64).flatten()
         all_preds = scaler.inverse_transform(all_preds.reshape(-1,1)).flatten()
         y_true = filled.values[window_size:]
@@ -217,14 +228,12 @@ elif tool == "Backtest":
             'actual': y_true,
             'predicted': all_preds
         })
-        # Metrics
         mae = mean_absolute_error(y_true, all_preds)
         mse = mean_squared_error(y_true, all_preds)
         r2 = r2_score(y_true, all_preds)
         st.metric("MAE", f"{mae:.2f}")
         st.metric("MSE", f"{mse:.2f}")
         st.metric("R²", f"{r2:.2f}")
-        # Plot
         df_melt = df_bt.melt(id_vars='date', value_vars=['actual','predicted'], var_name='type', value_name='rainfall')
         fig2 = px.line(df_melt, x='date', y='rainfall', color='type', labels={'rainfall':'Rainfall','type':'Series'})
         st.plotly_chart(fig2, use_container_width=True)
@@ -239,25 +248,25 @@ elif tool == "Tune Window Size":
     st.header("Window Size Tuning")
     steps = list(range(10, 61, 10))
     results = []
+    series_full = (
+        data[data['region']==selected_region]
+        .set_index('date')['rainfall']
+        .asfreq('10D')
+        .fillna(method='ffill').fillna(method='bfill')
+    )
     for w in steps:
-        seqs = prepare_sequences(
-            data[data['region']==selected_region]
-            .set_index('date')['rainfall']
-            .asfreq('10D')
-            .fillna(method='ffill').fillna(method='bfill'),
-            w
-        )
+        seqs = prepare_sequences(series_full, w)
         if seqs.size == 0:
             continue
         preds = model.predict(seqs, batch_size=64).flatten()
         preds = scaler.inverse_transform(preds.reshape(-1,1)).flatten()
-        y_true = data[data['region']==selected_region].set_index('date')['rainfall'].asfreq('10D').fillna(method='ffill').fillna(method='bfill').values[w:]
+        y_true = series_full.values[w:]
         mae = mean_absolute_error(y_true, preds)
         results.append({'window_size': w, 'MAE': mae})
-    df_tune = pd.DataFrame(results)
-    best = df_tune.loc[df_tune['MAE'].idxmin()]
-    st.write(f"**Best window size:** {int(best.window_size)} with MAE={best.MAE:.2f}")
-    st.dataframe(df_tune.set_index('window_size'))
+    df_tune = pd.DataFrame(results).set_index('window_size')
+    best = df_tune['MAE'].idxmin()
+    st.write(f"**Best window size:** {best} (MAE={df_tune.loc[best,'MAE']:.2f})")
+    st.dataframe(df_tune)
 
 # -----------------------------
 # Packaging & Deployment Guide

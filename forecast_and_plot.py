@@ -1,52 +1,49 @@
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import load_model
+import numpy as np
 from sklearn.preprocessing import MinMaxScaler
+from keras.models import load_model
 
-# Load the GRU model
-model = load_model("taqsense_gru_model.h5", compile=False)
-model.compile(optimizer="adam", loss="mean_squared_error")  # recompile
+# Load model and scaler from disk
 
-# Load your preprocessed test data
-df = pd.read_csv("ssd-rainfall-adm2-full.csv")
+def load_model_and_scaler(model_path='taqsense_gru_model.h5', scaler_path='taqsense_scaler.save'):
+    """
+    Loads the trained GRU model and scaler from disk.
+    Returns (model, scaler).
+    """
+    model = load_model(model_path)
+    import joblib
+    scaler = joblib.load(scaler_path)
+    return model, scaler
 
-# Optional: Filter for one region (e.g., Juba)
-df = df[df["ADM2_PCODE"] == "SS0101"]  # Replace with your desired region code
+# Prepare sequences for forecasting
 
-# Convert date and sort
-df["date"] = pd.to_datetime(df["date"], errors='coerce')
-df = df.dropna(subset=["date"])
-df = df.sort_values("date")
+def prepare_sequences(series, window_size=30):
+    """
+    Takes a 1D pandas Series or array and returns a numpy array
+    of shape (n_sequences, window_size) for forecasting.
+    """
+    arr = series.values if isinstance(series, pd.Series) else np.array(series)
+    seqs = []
+    for i in range(window_size, len(arr)):
+        seqs.append(arr[i-window_size:i])
+    return np.array(seqs)
 
-# Use rfh (rainfall estimate) as target feature
-data = df["rfh"].astype(float).fillna(method='ffill').values.reshape(-1, 1)
+# Rolling forecast utility
 
-# Normalize
-scaler = MinMaxScaler()
-data_scaled = scaler.fit_transform(data)
-
-# Prepare test input for prediction
-X = []
-look_back = 5
-for i in range(look_back, len(data_scaled)):
-    X.append(data_scaled[i - look_back:i])
-
-X = np.array(X)
-X = X.reshape((X.shape[0], X.shape[1], 1))
-
-# Predict
-predicted_scaled = model.predict(X)
-predicted = scaler.inverse_transform(predicted_scaled)
-
-# Plot
-plt.figure(figsize=(10, 5))
-plt.plot(df["date"].values[look_back:], data[look_back:], label="Actual Rainfall")
-plt.plot(df["date"].values[look_back:], predicted, label="Predicted Rainfall")
-plt.title("TaqSense Rainfall Forecast (GRU Model)")
-plt.xlabel("Date")
-plt.ylabel("Rainfall Estimate (RFH)")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+def rolling_forecast(series, model, scaler, window_size=30):
+    """
+    Performs a rolling one-step forecast over the entire series.
+    Returns a DataFrame with 'date', 'actual', and 'predicted' columns.
+    """
+    seqs = prepare_sequences(series, window_size)
+    preds = []
+    for seq in seqs:
+        scaled = scaler.transform(seq.reshape(-1,1)).reshape(1,window_size,1)
+        pred_scaled = model.predict(scaled)
+        pred = scaler.inverse_transform(pred_scaled)[0,0]
+        preds.append(pred)
+    dates = series.index[window_size:]
+    df = pd.DataFrame({'date': dates,
+                       'actual': series.values[window_size:],
+                       'predicted': preds})
+    return df
