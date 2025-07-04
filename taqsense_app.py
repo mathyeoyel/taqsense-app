@@ -82,6 +82,8 @@ st.sidebar.markdown("### Or select region via map👇")
 if 'map_selected' not in st.session_state:
     st.session_state.map_selected = None
 
+# ─── Interactive Map for Region Selection ───
+
 layer = pdk.Layer(
     "ScatterplotLayer",
     data=coords_df,
@@ -101,11 +103,12 @@ deck = pdk.Deck(
     layers=[layer],
     tooltip={"text":"{region}"}
 )
-r = st.sidebar.pydeck_chart(deck)
+st.sidebar.markdown("### Map of Counties (visual only)👇")
+st.sidebar.pydeck_chart(deck)
 
-selected = r.selected_rows()
-if selected:
-    st.session_state.map_selected = selected[0]['region']
+# NOTE: PyDeck charts in Streamlit don’t support click events,
+# so this map is for visualization only. Use the dropdowns below
+# to actually select your region(s).
 
 # ── Health Check & Page Setup ──
 
