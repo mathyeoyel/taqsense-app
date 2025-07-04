@@ -5,6 +5,7 @@ import datetime
 import os
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import plotly.express as px
+import pydeck as pdk
 import forecast_and_plot as fp
 
 # Default filename
@@ -56,9 +57,49 @@ data = load_data(uploaded_file)
 model = fp.model
 scaler = fp.scaler
 
-# Streamlit UI
+# ─── Interactive Map for Region Selection ───
+# Load full coords CSV and prepare lat/lon
+coords_csv = find_default_csv(DEFAULT_CSV)
+coords_df = pd.read_csv(coords_csv, comment='#')
+coords_df['date'] = pd.to_datetime(coords_df['date'], dayfirst=True, errors='coerce')
+coords_df.rename(columns={'ADM2_NAME':'region','Latitude':'lat','Longitude':'lon'}, inplace=True)
+coords_df = coords_df.dropna(subset=['lat','lon']).drop_duplicates(subset=['region'])
+
+st.sidebar.markdown("### Or select region via map👇")
+
+# Initialize session state for map selection
+if 'map_selected' not in st.session_state:
+    st.session_state.map_selected = None
+
+layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=coords_df,
+    get_position='[lon, lat]',
+    pickable=True,
+    get_radius=20000,
+    get_fill_color=[0, 128, 255, 160],
+)
+
+view_state = pdk.ViewState(
+    latitude=float(coords_df['lat'].mean()),
+    longitude=float(coords_df['lon'].mean()),
+    zoom=5,
+    pitch=0,
+)
+
+r = st.sidebar.pydeck_chart(pdk.Deck(
+    map_style='mapbox://styles/mapbox/light-v9',
+    initial_view_state=view_state,
+    layers=[layer],
+    tooltip={"text": "{region}"}
+))
+
+# Capture clicks
+if r.selected_rows:
+    st.session_state.map_selected = r.selected_rows[0]['region']
+
 # Health check endpoint
-params = st.experimental_get_query_params()
+params = st.query_params
 if "health" in params:
     st.write("healthy")
     st.stop()
@@ -70,7 +111,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title = "Taqsense Rainfall Forecasting & Backtest Dashboard"
+st.title("Taqsense Rainfall Forecasting & Backtest Dashboard")
 
 # Date-range picker
 min_date = data['date'].min().date()
@@ -85,30 +126,36 @@ if start_date > end_date:
     st.sidebar.error("End date must fall after start date.")
 
 # Mode selector
-tool = st.sidebar.selectbox("Mode", ["Forecast", "Backtest", "Tune Window Size"] )
+tool = st.sidebar.selectbox("Mode", ["Forecast", "Backtest", "Tune Window Size"])
 
-# Region selector
+# Region selector (uses map click as default if available)
 regions = sorted(data['region'].unique())
 if tool == "Forecast":
+    default = [st.session_state.map_selected] if st.session_state.map_selected else [regions[0]]
     selected_regions = st.sidebar.multiselect(
-        "Select region(s) for forecasting:", regions, default=[regions[0]]
+        "Select region(s) for forecasting:", regions, default=default
     )
 else:
-    selected_region = st.sidebar.selectbox("Select region:", regions)
+    default_idx = (
+        regions.index(st.session_state.map_selected)
+        if st.session_state.map_selected in regions else 0
+    )
+    selected_region = st.sidebar.selectbox(
+        "Select region:", regions, index=default_idx
+    )
 
 # Hyperparameter sliders
 window_size = st.sidebar.slider("Window size (dekads)", 10, 60, 30, 10)
 
-# Forecast branch
+# --------- Forecast Branch ---------
 if tool == "Forecast":
     st.header("Multi-Region Forecast")
     out_frames = []
     for region in selected_regions:
-        # filter series
         series = (
-            data[(data['region']==region) &
-                 (data['date'].dt.date>=start_date) &
-                 (data['date'].dt.date<=end_date)]
+            data[(data['region'] == region) &
+                 (data['date'].dt.date >= start_date) &
+                 (data['date'].dt.date <= end_date)]
             .set_index('date')['rainfall']
             .asfreq('10D')
         )
@@ -138,71 +185,81 @@ if tool == "Forecast":
             df_all, x='date', y='rainfall', color='region', line_dash='type',
             labels={'rainfall':'Rainfall','line_dash':'Series Type'}
         )
-        st.plotly_chart(fig)
+        st.plotly_chart(fig, use_container_width=True)
         st.download_button(
             "Download Forecast Results CSV",
             df_all.to_csv(index=False),
             "multi_region_forecast.csv"
         )
 
-# Backtest and Tune remain unchanged...
+# --------- Backtest Branch ---------
+elif tool == "Backtest":
+    st.header("Backtest Analysis")
+    series = (
+        data[(data['region'] == selected_region) &
+             (data['date'].dt.date >= start_date) &
+             (data['date'].dt.date <= end_date)]
+        .set_index('date')['rainfall']
+        .asfreq('10D')
+    )
+    filled = series.fillna(method='ffill').fillna(method='bfill')
+    seqs = prepare_sequences(filled, window_size)
+    if seqs.size == 0:
+        st.warning("Not enough data for backtest.")
+    else:
+        # batch predict
+        all_preds = model.predict(seqs, batch_size=64).flatten()
+        all_preds = scaler.inverse_transform(all_preds.reshape(-1,1)).flatten()
+        y_true = filled.values[window_size:]
+        dates = filled.index[window_size:]
+        df_bt = pd.DataFrame({
+            'date': dates,
+            'actual': y_true,
+            'predicted': all_preds
+        })
+        # Metrics
+        mae = mean_absolute_error(y_true, all_preds)
+        mse = mean_squared_error(y_true, all_preds)
+        r2 = r2_score(y_true, all_preds)
+        st.metric("MAE", f"{mae:.2f}")
+        st.metric("MSE", f"{mse:.2f}")
+        st.metric("R²", f"{r2:.2f}")
+        # Plot
+        df_melt = df_bt.melt(id_vars='date', value_vars=['actual','predicted'], var_name='type', value_name='rainfall')
+        fig2 = px.line(df_melt, x='date', y='rainfall', color='type', labels={'rainfall':'Rainfall','type':'Series'})
+        st.plotly_chart(fig2, use_container_width=True)
+        st.download_button(
+            "Download Backtest CSV",
+            df_bt.to_csv(index=False),
+            f"backtest_{selected_region}.csv"
+        )
+
+# --------- Tuning Branch ---------
+elif tool == "Tune Window Size":
+    st.header("Window Size Tuning")
+    steps = list(range(10, 61, 10))
+    results = []
+    for w in steps:
+        seqs = prepare_sequences(
+            data[data['region']==selected_region]
+            .set_index('date')['rainfall']
+            .asfreq('10D')
+            .fillna(method='ffill').fillna(method='bfill'),
+            w
+        )
+        if seqs.size == 0:
+            continue
+        preds = model.predict(seqs, batch_size=64).flatten()
+        preds = scaler.inverse_transform(preds.reshape(-1,1)).flatten()
+        y_true = data[data['region']==selected_region].set_index('date')['rainfall'].asfreq('10D').fillna(method='ffill').fillna(method='bfill').values[w:]
+        mae = mean_absolute_error(y_true, preds)
+        results.append({'window_size': w, 'MAE': mae})
+    df_tune = pd.DataFrame(results)
+    best = df_tune.loc[df_tune['MAE'].idxmin()]
+    st.write(f"**Best window size:** {int(best.window_size)} with MAE={best.MAE:.2f}")
+    st.dataframe(df_tune.set_index('window_size'))
 
 # -----------------------------
-# Packaging & Deployment
+# Packaging & Deployment Guide
 # -----------------------------
-# To containerize this Streamlit app, create the following Dockerfile in the app directory:
-#
-# --- Dockerfile ---
-# FROM python:3.10-slim
-# WORKDIR /app
-# COPY requirements.txt ./
-# RUN pip install --no-cache-dir -r requirements.txt
-# COPY . .
-# EXPOSE 8501
-# CMD ["streamlit", "run", "taqsense_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-# --- end Dockerfile ---
-#
-# And a requirements.txt with pinned dependencies:
-#
-# --- requirements.txt ---
-# streamlit>=1.20.0
-# pandas
-# numpy
-# scikit-learn
-# plotly
-# tensorflow  # or keras, depending on model
-#
-# To build and run the container locally:
-#   docker build -t taqsense-app .
-#   docker run -p 8501:8501 taqsense-app
-#
-# For deployment to Streamlit Community Cloud:
-# 1. Push this repo to GitHub
-# 2. In Streamlit Cloud, create a new app pointing to this repo and branch
-# 3. Specify the command `streamlit run taqsense_app.py`
-# 4. Cloud will auto-install from requirements.txt and launch your app.
-
-# Render Deployment Guide
-# ----------------------
-# 1. Create a GitHub repository and push all app files (including Dockerfile & requirements.txt).
-# 2. Sign up or log in to Render (https://render.com) and create a new Web Service.
-#    - Connect your GitHub account and select your repo.
-#    - For Environment, choose "Docker" (Render will auto-detect your Dockerfile).
-#    - Set the start command to:
-#        streamlit run taqsense_app.py --server.port=$PORT
-#    - The default port variable $PORT is provided by Render.
-# 3. In the "Advanced" settings:
-#    - Add any Environment Variables (e.g., STREAMLIT_SERVER_HEADLESS=true).
-#    - Adjust instance type if needed (512MB RAM free tier is default).
-# 4. Click "Create Web Service". Render will build and deploy your container.
-# 5. Once live, Render provides a URL (e.g., https://taqsense-app.onrender.com).
-# 6. To update, simply push new commits to GitHub; Render auto-deploys.
-#
-# Optional: Scheduled Retraining
-# - In Render Dashboard, create a new Cron Job service.
-# - Use the same repo, set the command to run a retraining script, e.g.: 
-#       python retrain_model.py
-# - Configure the schedule (e.g., daily at midnight) via cron syntax.
-
-# End of Render Deployment Guide
-# End of taqsense_app.py
+# (Dockerfile, requirements.txt, Render guide, etc.)
